@@ -26,6 +26,8 @@ lib-y += smmu.o
 # Vendor specific part
 ifeq ($(CONFIG_VENDOR),mediatek)
 
+lib-y += mtk-common.o mtk-common-eint.o mtk-common-gpio.o
+
 # SoC specific part
 ifeq ($(CONFIG_SOC),mt8365)
 lib-y += mtk-mt8365-eint.o mtk-mt8365-gpio.o

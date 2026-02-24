@@ -12,6 +12,7 @@
  * the COPYING file in the top-level directory.
  */
 
+#include <jailhouse/mmio.h>
 #include <jailhouse/types.h>
 
 
@@ -95,3 +96,6 @@ static inline u32 get_access_dist_idx (access_descr_t  access_descr)
     return ((u32) ACCESS_DIST_IDX (access_descr));
 }
 
+access_descr_t get_access_descr (struct mmio_access*        mmio,
+                                 const access_descr_map_t*  access_descr_map,
+                                 size_t                     access_descr_map_size);

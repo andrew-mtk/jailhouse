@@ -13,13 +13,8 @@
  * the COPYING file in the top-level directory.
  */
 
-#include <asm/irqchip.h>
-#include <asm/mtk-common.h>
-#include <jailhouse/cell.h>
+#include <asm/mtk-common-eint.h>
 #include <jailhouse/control.h>
-#include <jailhouse/paging.h>
-#include <jailhouse/percpu.h>
-#include <jailhouse/printk.h>
 #include <jailhouse/unit.h>
 
 
@@ -343,34 +338,25 @@ static const irq_descr_map_t  eint_irq_status_map [] =
     },
 };
 
-static const u32 eint_access_descr_map_size = ARRAY_SIZE (eint_access_descr_map);
-static const u32 eint_irq_status_map_size   = ARRAY_SIZE (eint_irq_status_map);
-
-
-static spinlock_t lock;
-
-static void* virt_addr = NULL;
-
 
 static u32 one_bit_per_pin (access_descr_t  access_descr);
 static u32 addr_to_bitmap (struct mmio_access*  mmio,
                            access_descr_t       access_descr);
 
-static void handle_ro_access (struct mmio_access*  mmio,
-                              access_descr_t       access_descr);
-static void handle_wo_access (struct mmio_access*  mmio,
-                              access_descr_t       access_descr);
-static void handle_rw_access (struct mmio_access*  mmio,
-                              access_descr_t       access_descr);
 
-static u16 get_access_descr (struct mmio_access*  mmio);
-static enum mmio_result eint_handle_access (void*                arg,
-                                            struct mmio_access*  mmio);
+static const eint_config_descr_t mt8370_eint_config_descr =
+{
+    .addr_to_bitmap = addr_to_bitmap,
 
-static int get_phys_addr (struct cell*    cell,
-                          unsigned long*  phys_addr);
+    .access_descr_map = eint_access_descr_map,
+    .irq_status_map   = eint_irq_status_map,
 
-static bool irq_handler(u16 irq_id);
+    .access_descr_map_size = ARRAY_SIZE (eint_access_descr_map),
+    .irq_status_map_size   = ARRAY_SIZE (eint_irq_status_map),
+    .reg_size              = EINT_SIZE,
+
+    .irq_id = EINT_IRQ_ID,
+};
 
 
 static u32 one_bit_per_pin (access_descr_t  access_descr)
@@ -403,396 +389,29 @@ static u32 addr_to_bitmap (struct mmio_access*  mmio,
     return (0xffffffff);
 }
 
-static void handle_ro_access (struct mmio_access*  mmio,
-                              access_descr_t       access_descr)
-{
-	if (! (mmio->is_write))
-	{
-        u32 bitmap = addr_to_bitmap (mmio, access_descr);
-
-
-        if (bitmap != 0)
-        {
-            mmio_perform_access (virt_addr, mmio);
-
-      		/* Only allow the bits for which access is allowed. */
-	    	mmio->value &= bitmap;
-        }
-        else
-        {
-            mmio->value = 0;
-        }
-    }
-}
-
-static void handle_wo_access (struct mmio_access*  mmio,
-                              access_descr_t       access_descr)
-{
-	if (mmio->is_write)
-	{
-        u32 bitmap = addr_to_bitmap (mmio, access_descr);
-
-
-		/* Only allow the bits for which access is allowed. */
-        if ((bitmap != 0)                            &&
-            ((mmio->value & bitmap) == mmio->value))
-        {
-            mmio_perform_access (virt_addr, mmio);
-        }
-    }
-}
-
-static void handle_rw_access (struct mmio_access*  mmio,
-                              access_descr_t       access_descr)
-{
-    if (! (mmio->is_write))
-    {
-        handle_ro_access (mmio, access_descr);
-    }
-    else
-    {
-    	u32 bitmap = addr_to_bitmap (mmio, access_descr);
-
-
-        if ((bitmap != 0)                            &&
-            ((mmio->value & bitmap) == mmio->value))
-        {
-            struct mmio_access curr_mmio;
-
-
-            curr_mmio.address  = mmio->address;
-            curr_mmio.size     = mmio->size;
-            curr_mmio.is_write = false;
-
-    	    /* Perform a read-update-write operation. This must be done inside a lock     */
-            /* since the read-update-write operation must be atomic. In addition, this    */
-            /* MMIO write operation could be executed from multiple cells simmultanously. */
-	        spin_lock (&lock);
-	        mmio_perform_access (virt_addr, &curr_mmio);
-
-            mmio->value |= (curr_mmio.value & ~ (bitmap));
-
-            mmio_perform_access (virt_addr, mmio);
-        	spin_unlock (&lock);
-        }
-    }
-}
-
-static u16 get_access_descr (struct mmio_access*  mmio)
-{
-    u32 idx = 0;
-
-
-    if ((mmio->address & 0x00000003) != 0)
-    {
-        return (ACCESS_DESCR_EMPTY);
-    }
-
-    while (idx < eint_access_descr_map_size)
-    {
-        if ((mmio->address >= eint_access_descr_map [idx].reg_start) &&
-            (mmio->address <  eint_access_descr_map [idx].reg_end))
-        {
-            return (eint_access_descr_map [idx].access_descr [(mmio->address - eint_access_descr_map [idx].reg_start) >> 2]);
-        }
-
-        idx++;
-    }
-
-    return (ACCESS_DESCR_EMPTY);
-}
-
-static enum mmio_result eint_handle_access (void*                arg,
-                                            struct mmio_access*  mmio)
-{
-    access_descr_t access_descr = get_access_descr (mmio);
-
-
-	switch (get_access_type (access_descr))
-	{
-        case ACCESS_RO:
-            handle_ro_access (mmio, access_descr);
-            break;
-
-        case ACCESS_WO:
-            handle_wo_access (mmio, access_descr);
-            break;
-
-        case ACCESS_RW:
-            handle_rw_access (mmio, access_descr);
-            break;
-
-        default:
-	    	/* The remaing EINT accesses shall only be performed by the root cell. */
-            if (this_cell () == &root_cell)
-			{
-				/* No access lock is required since only the root cell is allowed */
-				/* to perform the MMIO accesses. Hence, the root cell is responsible */
-				/* for controlling access when multiple root cell programs try to */
-				/* perform MMIO read / write operations. */
-				mmio_perform_access (virt_addr, mmio);
-			}
-			else
-			{
-				if (! (mmio->is_write))
-				{
-					/* Simply return '0' for any read operation. */
-					mmio->value = 0;
-				}
-			}
-			break;
-	}
-
-	return (MMIO_HANDLED);
-}
-
-static int get_phys_addr (struct cell*    cell,
-                          unsigned long*  phys_addr)
-{
-	unsigned int                   cnt;
-	const struct jailhouse_vendor* vendor;
-
-
-    (*phys_addr) = 0;
-
-    FOR_EACH_VENDOR (vendor, cell->config, cnt)
-	{
-		if (vendor->type != JAILHOUSE_VENDOR_MTK_EINT)
-		{
-			continue;
-		}
-
-		if (((*phys_addr) != 0)                         &&
-            (vendor->mtk_eint.address != (*phys_addr)))
-		{
-			return (-EINVAL);
-		}
-
-        (*phys_addr) = vendor->mtk_eint.address;
-	}
-
-    return (0);
-}                          
-
-static bool irq_handler (u16 irq_id)
-{
-    u32          eint_sta;
-    size_t       idx = 0;
-    struct cell* cell;
-
-
-    if ((virt_addr == NULL)      ||
-        (irq_id != EINT_IRQ_ID))
-	{
-        return (false);
-    }
-
-    while (idx < eint_irq_status_map_size)
-    {
-        /* Find the source for the EINT interrupt. */
-        eint_sta = mmio_read32 ((void*) (((unsigned long) virt_addr) + eint_irq_status_map [idx].reg)) & eint_irq_status_map [idx].mask;
-        if (eint_sta != 0)
-        {
-            /* We found an EINT status which indicated an asserted interrupt. */
-            break;
-        }
-
-        idx++;
-    }
-
-    if (idx >= eint_irq_status_map_size)
-    {
-        /* Didn't find an EINT source. Let the standard */
-        /* IRQ handler do the work.                     */
-        return (false);
-    }
-
-    /* Ok, let's now find the cell which is configured to handle this EINT IRQ. */
-    for_each_cell (cell)
-    {
-        /* The cell must have the EINT IRQ enabled as well as */
-        /* have the specific EINT interrupt source enabled.   */
-        if (((cell->arch.irq_bitmap [irq_id / 32] & (1 << (irq_id % 32))) != 0) &&
-            ((cell->arch.eint_bitmap [idx] & eint_sta) != 0))
-        {
-            /* Found a cell which can handle this EINT interrupt. */
-            break;
-        }
-    }
-
-    if (cell == NULL)
-    {
-        /* Didn't find a cell. Let the standard */
-        /* IRQ handler do the work.             */
-        return (false);
-    }
-
-    irqchip_set_pending (public_per_cpu (first_cpu (cell->cpu_set)), irq_id);
-
-    return (true);
-}
-
 static int mt8370_eint_cell_init (struct cell*  cell)
 {
-	size_t                         pos;
-	unsigned int                   cnt;
-	unsigned long                  address = 0;
-	const struct jailhouse_vendor* vendor;
-
-
-	FOR_EACH_VENDOR (vendor, cell->config, cnt)
-	{
-		if (vendor->type != JAILHOUSE_VENDOR_MTK_EINT)
-		{
-			continue;
-		}
-
-		/* Verify that the EINT entries in the cell description are valid. */
-		if (((vendor->mtk_eint.pin_base % sizeof (vendor->mtk_eint.pin_bitmap [0])) != 0)                                       ||
-		    ((vendor->mtk_eint.pin_base + (sizeof (vendor->mtk_eint.pin_bitmap) * 8)) > (sizeof (cell->arch.eint_bitmap) * 8)))
-		{
-			return (-EINVAL);
-		}
-
-        /* Only one EINT address per cell is supported. */
-		if ((address != 0)                         &&
-	        (vendor->mtk_eint.address != address))
-		{
-			return (-EINVAL);
-		}
-
-		address = vendor->mtk_eint.address;
-
-		/* Copy the EINT entries. */
-		for (pos = 0; pos < ARRAY_SIZE (vendor->mtk_eint.pin_bitmap); pos++)
-		{
-			cell->arch.eint_bitmap [(vendor->mtk_eint.pin_base / (sizeof (vendor->mtk_eint.pin_bitmap [0]) * 8)) + pos] |= vendor->mtk_eint.pin_bitmap [pos];
-		}
-	}
-
-   	/* Register handler. */
-    mmio_region_register (cell, address, EINT_SIZE, eint_handle_access, (void*) address);
-
-    /* And lastly, remove the EINT entries from the root cell. */
-	if (cell != &root_cell)
-	{
-		for (pos = 0; pos < ARRAY_SIZE (cell->arch.eint_bitmap); pos++)
-		{
-			root_cell.arch.eint_bitmap [pos] &= ~(cell->arch.eint_bitmap [pos]);
-		}
-    }
-
-	return (0);
+    return (mtk_eint_cell_init (cell));
 }
 
 static void mt8370_eint_cell_exit (struct cell*  cell)
 {
-	size_t                         pos;
-	unsigned int                   cnt;
-	const struct jailhouse_vendor* vendor;
-
-
-	if (cell != &root_cell)
-	{
-		/* Return the EINT entries to the root cell. */
-		for (pos = 0; pos < ARRAY_SIZE (cell->arch.eint_bitmap); pos++)
-		{
-			root_cell.arch.eint_bitmap [pos] |= cell->arch.eint_bitmap [pos];
-		}
-
-		/* Mask out bits which were not part of the root cell. */
-		FOR_EACH_VENDOR (vendor, root_cell.config, cnt)
-		{
-			if (vendor->type != JAILHOUSE_VENDOR_MTK_EINT)
-			{
-				continue;
-			}	
-
-			for (pos = 0; pos < ARRAY_SIZE (vendor->mtk_eint.pin_bitmap); pos++)
-			{
-				root_cell.arch.eint_bitmap [(vendor->mtk_eint.pin_base / (sizeof (vendor->mtk_eint.pin_bitmap [0]) * 8)) + pos] &= vendor->mtk_eint.pin_bitmap [pos];
-			}
-		}
-	}
+    mtk_eint_cell_exit (cell);
 }
 
 static unsigned int mt8370_eint_mmio_count_regions (struct cell*  cell)
 {
-	/* Only one MMIO EINT region handler per cell. */
-	return (1);
+    return (mtk_eint_mmio_count_regions (cell));
 }
 
 static int mt8370_eint_init (void)
 {
-	int           ret = 0;
-    unsigned long phys_addr = 0;
-
-
-	if (virt_addr == NULL)
-	{
-		/* Create hypervisor paging for EINT access. */
-        /* This is only done once with the root cell. */
-        ret = get_phys_addr (&root_cell, &phys_addr);
-		if (ret != 0)
-		{
-			return (ret);
-		}
-
-        if (phys_addr != 0)
-        {
-            virt_addr = paging_map_device (phys_addr, EINT_SIZE);
-            if (virt_addr == NULL)
-            {
-                ret = -ENOMEM;
-            }
-        }
-
-        ret = irqchip_register_irq_handler (EINT_IRQ_ID, irq_handler);
-        if (ret != 0)
-        {
-		    /* Cleanup if cell IRQ handler registration failed. */
-            if (virt_addr != NULL)
-            {
-                paging_unmap_device (phys_addr, virt_addr, EINT_SIZE);
-
-                virt_addr = NULL;
-            }
-        }
-
-    	ret = mt8370_eint_cell_init (&root_cell);
-
-    	if (ret != 0)
-	    {
-		    /* Cleanup if cell initialization failed. */
-            irqchip_unregister_irq_handler (EINT_IRQ_ID);
-
-    		if (virt_addr != NULL)
-	    	{
-                paging_unmap_device (phys_addr, virt_addr, EINT_SIZE);
-
-                virt_addr = NULL;
-	    	}
-	    }
-    }
-
-	return (ret);
+    return (mtk_eint_init (&mt8370_eint_config_descr));
 }
 
 static void mt8370_eint_shutdown (void)
 {
-    unsigned long phys_addr;
-
-
-    irqchip_unregister_irq_handler (EINT_IRQ_ID);
-
-	if (virt_addr != NULL)
-	{
-        get_phys_addr (&root_cell, &phys_addr);
-
-        paging_unmap_device (phys_addr, virt_addr, EINT_SIZE);
-
-		virt_addr = NULL;
-	}
+    mtk_eint_shutdown ();
 }
 
 DEFINE_UNIT (mt8370_eint, "mt8370_eint");
